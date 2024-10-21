@@ -1,6 +1,5 @@
 import Foundation
 import AVFoundation
-import SwiftPrettyPrint
 
 final class ABR {
     let queue: DispatchQueue
@@ -120,6 +119,9 @@ final class HLSPlaylistLoader {
         }
     }
     
+    var nextAudioStartTime: CMTime = .zero
+    var nextVideoStartTime: CMTime = .zero
+
     private func read(
         fragment: M3U8Playlist.Fragment,
         initSegmentData: Data,
@@ -139,57 +141,76 @@ final class HLSPlaylistLoader {
         var avAudioDuration: CMTime = .zero
         var avVideoDuration: CMTime = .zero
         
-        let composition = AVMutableComposition()
-        var readStart = basetime
-        if let previousReadAsset = previousReadAsset {
-            try! composition.insertTimeRange(CMTimeRange(start: .zero, end: previousReadAsset.duration), of: previousReadAsset, at: readStart - previousReadAsset.duration)
-            readStart = composition.duration
-        }
-        let newAsset = AVURLAsset(url: fileUrl)
-        try! composition.insertTimeRange(CMTimeRange(start: .zero, end: newAsset.duration), of: newAsset, at: readStart)
+        let asset = AVURLAsset(url: fileUrl)
         
-        let reader = try! AVAssetReader(asset: composition)
-        reader.timeRange = CMTimeRange(start: readStart, duration: newAsset.duration)
+        let reader = try! AVAssetReader(asset: asset)
         
-        let audioTrack = composition.tracks(withMediaType: .audio)[0]
-        let audioOutputSettings: [String: Any] = [
-            AVFormatIDKey: kAudioFormatLinearPCM
-//            AVSampleRateKey: audioTrack.naturalTimeScale
-        ]
-        let audioOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: audioOutputSettings)
+        let audioTrack = asset.tracks(withMediaType: .audio)[0]
+        let audioOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
         reader.add(audioOutput)
         
-        let videoTrack = composition.tracks(withMediaType: .video)[0]
-//        let videoOutputSettings: [String: Any] = [
-//            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
-//        ]
+        let videoTrack = asset.tracks(withMediaType: .video)[0]
         let videoOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: nil)
         reader.add(videoOutput)
         reader.startReading()
         
+        let audioOrigin = nextAudioStartTime
+
         while let buffer = audioOutput.copyNextSampleBuffer() {
-            audioBuffers.append(buffer)
+            if CMSampleBufferGetNumSamples(buffer) == 0 {
+                continue
+            }
+
+            let adjustedBuffer = buffer.adjustTiming(baseTime: audioOrigin)!
+            // only need to apply for the first sample buffer of every subsequent file
+
+            if audioOrigin != .zero
+            {
+                // trimming from non-initial fragments causes an audio dropout
+                CMRemoveAttachment(adjustedBuffer, key: kCMSampleBufferAttachmentKey_TrimDurationAtStart)
+            }
+
+            audioBuffers.append(adjustedBuffer)
+
             avAudioDuration = CMTimeAdd(avAudioDuration, buffer.time.duration)
+
+            nextAudioStartTime = CMTimeAdd(nextAudioStartTime, CMSampleBufferGetDuration(buffer))
         }
+
+        let videoOrigin = nextVideoStartTime
         
         while let buffer = videoOutput.copyNextSampleBuffer() {
-            videoBuffers.append(buffer)
+            if CMSampleBufferGetNumSamples(buffer) == 0 {
+                continue // edit boundary, drain after decoding, EmptyMedia, PermanentEmptyMedia
+            }
+
+            let adjustedBuffer = buffer.adjustTiming(baseTime: videoOrigin)!
+                videoBuffers.append(adjustedBuffer)
+
+            if videoOrigin != .zero {
+                // This doesn't seem to matter as initial change is likely an i-frame
+                // but the non segmented file doesn't have it, so rip it out
+                CMRemoveAttachment(adjustedBuffer, key: kCMSampleBufferAttachmentKey_ResetDecoderBeforeDecoding)
+            }
+
             avVideoDuration = CMTimeAdd(avVideoDuration, buffer.time.duration)
+
+            nextVideoStartTime = CMTimeAdd(nextVideoStartTime, CMSampleBufferGetDuration(buffer))
         }
-        
+
         let loadedFragment = HLSFragment(
             fragment: fragment,
             videoBuffers: videoBuffers,
             audioBuffers: audioBuffers ,
             videoDuration: avVideoDuration,
             audioDuration: avAudioDuration,
-            assetDuration: newAsset.duration
+            assetDuration: asset.duration
         )
         
         if let previousReadAsset {
             try! FileManager.default.removeItem(at: previousReadAsset.url)
         }
-        self.previousReadAsset = newAsset
+        self.previousReadAsset = asset
         logger.debug(tag: "readEnd", "r: \(playlist.resolution), ad: \(avAudioDuration.seconds), vd: \(avVideoDuration.seconds)")
         
         queue.async {
