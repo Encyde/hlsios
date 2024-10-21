@@ -59,6 +59,8 @@ extension CMSampleBuffer {
         
         if let baseTime {
             timingInfo.presentationTimeStamp = CMTimeAdd(timingInfo.presentationTimeStamp, baseTime)
+            // don't really seem to need DTS, but let's try to appear more like non segmented file
+            timingInfo.decodeTimeStamp = CMTimeAdd(timingInfo.decodeTimeStamp, baseTime)
         }
 
         var newSampleBuffer: CMSampleBuffer?
